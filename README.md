@@ -155,3 +155,76 @@ Setting `no_cache: false` permits builder-local cache use but does not configure
 persistent caching across hosted runner jobs. Initial builds should verify disk
 usage and duration against hosted runner limits. Live builds and Docker Hub
 publishing require running this workflow in a configured calling repository.
+
+## Discord release notifications
+
+`.github/workflows/discord-notify.yml` posts an existing GitHub Release's notes
+and link to a Discord channel through an incoming webhook. The card title
+includes the calling repository's name so multiple repositories can share a
+channel. Draft releases are rejected. No checkout, Discord bot, or PAT is needed.
+
+Create a Discord incoming webhook for the destination channel, then configure
+`DISCORD_WEBHOOK_URL` as an Actions repository secret or organization secret
+available to each calling repository. Secrets stored only in this shared-workflows
+repository are not available to callers. Treat the webhook URL as a credential.
+
+### Automatic release integration
+
+Publish this reusable workflow to this repository's `main` branch before adding
+callers. In each repository's existing release caller, add this job alongside
+`jobs.release` (the release caller example above uses that job ID):
+
+```yaml
+  discord-notify:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    permissions:
+      contents: read
+    uses: ROBOTIS-GIT/github-workflows/.github/workflows/discord-notify.yml@main
+    with:
+      version: ${{ needs.release.outputs.version }}
+    secrets:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+```
+
+This posts only after successful release creation and runs independently of
+Docker publishing. Do not use a separate `release: published` event to chain
+from the current release workflow: releases created with `GITHUB_TOKEN` do not
+trigger it. Notification failure fails the notification job; the published
+GitHub Release remains available.
+
+### Manual posting or retry
+
+For an existing release, save this caller as a separate workflow on the calling
+repository's default branch, then run it with the release tag. This retries
+notification without recreating the release (rerunning release creation fails
+its duplicate/version validation).
+
+```yaml
+name: Notify Discord
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing published release tag
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  discord-notify:
+    uses: ROBOTIS-GIT/github-workflows/.github/workflows/discord-notify.yml@main
+    with:
+      version: ${{ inputs.version }}
+    secrets:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+```
+
+Long notes are truncated to 1,900 characters plus a link reminder; the title
+is limited to 120 characters. These conservative limits accommodate emoji
+within Discord embed limits. Empty notes show a link reminder. Mentions are
+disabled. Repeated calls post new messages, so check the channel before retrying
+a request whose result is uncertain. The workflow does not retry automatically.
+
+Local payload checks: `python3 -m unittest discover -s tests -v` (requires
+Python 3, PyYAML, and jq). Live delivery requires a configured calling repository.
