@@ -1,0 +1,169 @@
+name: Reusable ROS bloom release
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: Repository key in ros/rosdistro (for example dynamixel_sdk)
+        required: true
+        type: string
+      release_repository:
+        description: Existing GitHub release repository (owner/repository)
+        required: true
+        type: string
+      version:
+        description: Published stable GitHub Release tag, exactly X.Y.Z
+        required: true
+        type: string
+      distros:
+        description: Whitespace-separated existing bloom tracks, processed sequentially
+        default: humble jazzy kilted lyrical rolling
+        type: string
+      git_user_name:
+        description: Git identity used for commits and DCO sign-off
+        required: true
+        type: string
+      git_user_email:
+        description: Verified GitHub email belonging to the signing key
+        required: true
+        type: string
+      signing_key_fingerprint:
+        description: Fingerprint of the GitHub-registered GPG signing key
+        required: true
+        type: string
+      tools_ref:
+        description: Shared helper ref; pin together with the reusable workflow ref
+        default: main
+        type: string
+    secrets:
+      BLOOM_GITHUB_TOKEN:
+        description: User PAT with release-repository push and rosdistro fork/PR access
+        required: true
+      BLOOM_GPG_PRIVATE_KEY:
+        description: ASCII-armored private GPG signing key registered on GitHub
+        required: true
+      BLOOM_GPG_PASSPHRASE:
+        description: Passphrase for the private key (omit for an unencrypted key)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  bloom:
+    name: Release ROS distributions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Runs for a shared release repository must have one calling repository owner.
+    concurrency:
+      group: bloom-${{ inputs.release_repository }}
+      cancel-in-progress: false
+    env:
+      BLOOM_REPOSITORY: ${{ inputs.repository }}
+      BLOOM_RELEASE_REPOSITORY: ${{ inputs.release_repository }}
+      BLOOM_VERSION: ${{ inputs.version }}
+      BLOOM_DISTROS: ${{ inputs.distros }}
+      BLOOM_HELPER: ${{ github.workspace }}/bloom-tools/scripts/bloom_release.py
+      GIT_TERMINAL_PROMPT: '0'
+      BLOOM_DONT_ASK_FOR_DOCS: '1'
+      BLOOM_DONT_ASK_FOR_SOURCE: '1'
+      BLOOM_DONT_ASK_FOR_MAINTENANCE_STATUS: '1'
+      BLOOM_NO_WEBBROWSER: '1'
+    steps:
+      - name: Initialize temporary paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "BLOOM_PUSH_RECEIPTS=$RUNNER_TEMP/bloom-push-receipts.jsonl" \
+            "BLOOM_KEY_PASSPHRASE_FILE=$RUNNER_TEMP/bloom-key-passphrase" \
+            "GNUPGHOME=$RUNNER_TEMP/bloom-gnupg" \
+            "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/bloom-gitconfig" >> "$GITHUB_ENV"
+
+      - name: Check out shared helper
+        uses: actions/checkout@v4
+        with:
+          repository: ROBOTIS-GIT/github_workflows
+          ref: ${{ inputs.tools_ref }}
+          path: bloom-tools
+          persist-credentials: false
+
+      - name: Install bloom
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/bloom-venv"
+          "$RUNNER_TEMP/bloom-venv/bin/pip" install 'bloom==0.14.4' 'rosdep==0.27.0'
+          echo "$RUNNER_TEMP/bloom-venv/bin" >> "$GITHUB_PATH"
+          if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then
+            sudo "$RUNNER_TEMP/bloom-venv/bin/rosdep" init
+          fi
+          "$RUNNER_TEMP/bloom-venv/bin/rosdep" update --include-eol-distros
+
+      - name: Configure identity, signing, and push guards
+        env:
+          GH_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.BLOOM_GPG_PRIVATE_KEY }}
+          KEY_PASSPHRASE: ${{ secrets.BLOOM_GPG_PASSPHRASE }}
+          KEY_FINGERPRINT: ${{ inputs.signing_key_fingerprint }}
+          GIT_USER_NAME: ${{ inputs.git_user_name }}
+          GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$GH_TOKEN" && test -n "$PRIVATE_KEY"
+          test -n "$GIT_USER_NAME" && test -n "$GIT_USER_EMAIL"
+          [[ "$KEY_FINGERPRINT" =~ ^[0-9A-Fa-f]{40}$ ]]
+          mkdir -p "$GNUPGHOME"
+          printf '%s' "$KEY_PASSPHRASE" > "$BLOOM_KEY_PASSPHRASE_FILE"
+          printf '%s' "$PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --list-secret-keys "$KEY_FINGERPRINT" > /dev/null
+          # Check registration before creating any commits.
+          gh api 'user' --jq .login > "$RUNNER_TEMP/bloom-login"
+          gh api "users/$(cat "$RUNNER_TEMP/bloom-login")/gpg_keys" \
+            > "$RUNNER_TEMP/bloom-registered-keys.json"
+          jq -r '.[] | select(.raw_key != null) | .raw_key' \
+            "$RUNNER_TEMP/bloom-registered-keys.json" > "$RUNNER_TEMP/bloom-registered-keys"
+          gpg --show-keys --with-colons "$RUNNER_TEMP/bloom-registered-keys" \
+            | awk -F: '$1 == "fpr" { print toupper($10) }' \
+            | grep -Fx "${KEY_FINGERPRINT^^}"
+          jq -e --arg email "$GIT_USER_EMAIL" --arg key "${KEY_FINGERPRINT: -16}" '
+            any(.[];
+              ((.key_id | ascii_upcase) == ($key | ascii_upcase) or
+                any(.subkeys[]; (.key_id | ascii_upcase) == ($key | ascii_upcase))) and
+              any(.emails[]; .email == $email and .verified == true))
+          ' "$RUNNER_TEMP/bloom-registered-keys.json" > /dev/null
+          cat > "$RUNNER_TEMP/bloom-gpg" <<'SH'
+          #!/bin/sh
+          exec /usr/bin/gpg --batch --pinentry-mode loopback --passphrase-file "$BLOOM_KEY_PASSPHRASE_FILE" "$@"
+          SH
+          chmod 700 "$RUNNER_TEMP/bloom-gpg"
+          git config --global user.name "$GIT_USER_NAME"
+          git config --global user.email "$GIT_USER_EMAIL"
+          git config --global user.signingkey "$KEY_FINGERPRINT"
+          git config --global gpg.format openpgp
+          git config --global commit.gpgsign true
+          git config --global gpg.program "$RUNNER_TEMP/bloom-gpg"
+          # Feed Git credentials over stdin; never embed tokens in repository URLs.
+          git config --global credential.helper '!gh auth git-credential'
+          python3 "$BLOOM_HELPER" setup-hooks "$RUNNER_TEMP/bloom-hooks"
+
+      - name: Generate signed releases and rosdistro pull requests
+        env:
+          GH_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$BLOOM_HELPER"
+
+      - name: Remove credentials
+        if: always()
+        shell: bash
+        run: |
+          gpgconf --kill gpg-agent || true
+          rm -rf "$GNUPGHOME"
+          rm -f "$BLOOM_KEY_PASSPHRASE_FILE" "$GIT_CONFIG_GLOBAL" \
+            "$RUNNER_TEMP/bloom-gpg" "$RUNNER_TEMP/bloom-registered-keys" \
+            "$RUNNER_TEMP/bloom-registered-keys.json" \
+            "$RUNNER_TEMP/bloom-login" "$HOME/.config/bloom"

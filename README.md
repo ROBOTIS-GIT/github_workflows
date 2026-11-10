@@ -228,3 +228,157 @@ a request whose result is uncertain. The workflow does not retry automatically.
 
 Local payload checks: `python3 -m unittest discover -s tests -v` (requires
 Python 3, PyYAML, and jq). Live delivery requires a configured calling repository.
+
+## ROS bloom releases
+
+`.github/workflows/bloom-release.yml` is a reusable workflow for repositories
+already onboarded to bloom. It releases the **calling repository's published
+`X.Y.Z` tag** into existing distro tracks, then creates PRs against
+`ros/rosdistro`. It does not merge those PRs or wait for build farm / apt sync.
+The shared GitHub Release workflow remains independent; callers opt into bloom.
+
+Tracks run sequentially, with `humble jazzy kilted lyrical rolling` as the default.
+The workflow temporarily pins each track's `version` and `release_tag` to the
+requested release, then restores those settings while preserving bloom's release
+revision. Track upstream URLs must identify the calling repository. All source
+`package.xml` versions must match the tag. Initial tracks and rosdistro release
+entries must already exist. First-time onboarding is
+manual. The same source tag must support every selected ROS distribution;
+this workflow does not establish compatibility or replace distro build tests.
+
+### Inputs and credentials
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `repository` | Required | Repository key in rosdistro, e.g. `dynamixel_sdk` |
+| `release_repository` | Required | Existing GitHub `owner/repository`, e.g. `ros2-gbp/dynamixel_sdk-release` |
+| `version` | Required | Published stable release tag, strictly `X.Y.Z` |
+| `distros` | `humble jazzy kilted lyrical rolling` | Whitespace-separated existing track names |
+| `git_user_name` | Required | Git committer name and DCO identity |
+| `git_user_email` | Required | Verified email associated with the signing key |
+| `signing_key_fingerprint` | Required | Full 40-character GPG fingerprint registered on GitHub |
+| `tools_ref` | `main` | Ref for the helper in `ROBOTIS-GIT/github_workflows` |
+
+Configure these Actions secrets in each caller, or organization secrets available
+to it, and pass them explicitly:
+
+- `BLOOM_GITHUB_TOKEN`: a user PAT with push access to the release repository,
+  access to the source repository, and permission to push a personal `rosdistro`
+  fork and open PRs against `ros/rosdistro`. For a classic token, bloom documents
+  `public_repo` and `workflow` scopes for public repositories; private repositories
+  need appropriate `repo` access. The caller's `GITHUB_TOKEN` is insufficient.
+- `BLOOM_GPG_PRIVATE_KEY`: an ASCII-armored private signing key registered to the
+  token owner's GitHub account. Supply it from your existing secure key storage.
+- `BLOOM_GPG_PASSPHRASE`: its passphrase; optional for an unencrypted key.
+
+Set Actions variables `BLOOM_GIT_NAME`, `BLOOM_GIT_EMAIL`, and
+`BLOOM_GPG_FINGERPRINT` to the intended user's configured Git identity and signing
+key fingerprint. New commits receive DCO sign-offs and cryptographic signatures.
+Before the first run, create a personal fork of `ros/rosdistro` named `rosdistro`
+under the token owner's account. This avoids bloom's interactive fork prompt.
+GitHub pushes are guarded by local signature/DCO checks, then GitHub verification
+is checked after publication. A signing or verification failure fails the job;
+there is no unsigned fallback. A post-push verification failure may leave signed
+commits published and needs investigation before retrying.
+
+The workflow uses GitHub-hosted Ubuntu runners and pinned bloom/rosdep versions.
+It imports the key into a temporary GPG directory and removes the key, passphrase,
+Git configuration, and bloom credentials in an `always()` cleanup step.
+Release repositories and their bloom actions must be trusted: bloom executes
+track commands with the credentials provided to the job.
+
+### Run automatically after a GitHub Release
+
+Add this job alongside the existing `release` caller job in the consuming
+repository. For DynamixelSDK:
+
+```yaml
+  bloom-release:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    permissions:
+      contents: read
+    uses: ROBOTIS-GIT/github_workflows/.github/workflows/bloom-release.yml@main
+    with:
+      repository: dynamixel_sdk
+      release_repository: ros2-gbp/dynamixel_sdk-release
+      version: ${{ needs.release.outputs.version }}
+      git_user_name: ${{ vars.BLOOM_GIT_NAME }}
+      git_user_email: ${{ vars.BLOOM_GIT_EMAIL }}
+      signing_key_fingerprint: ${{ vars.BLOOM_GPG_FINGERPRINT }}
+    secrets:
+      BLOOM_GITHUB_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+      BLOOM_GPG_PRIVATE_KEY: ${{ secrets.BLOOM_GPG_PRIVATE_KEY }}
+      BLOOM_GPG_PASSPHRASE: ${{ secrets.BLOOM_GPG_PASSPHRASE }}
+```
+
+Other repositories change `repository` and `release_repository`; override
+`distros` when their supported tracks differ. Publish the reusable workflow and
+helper to `main` before adding callers. When pinning the workflow to a commit,
+set `tools_ref` to the **same commit SHA** so its Python helper is pinned too.
+The source repository does not need to contain any helper scripts.
+
+Do not use a separate `release: published` event to chain from the existing
+release job: releases created with `GITHUB_TOKEN` do not trigger that workflow.
+Use its `published`/`version` outputs as above.
+
+### Manual execution and retry
+
+Add a separate caller on the source repository's default branch:
+
+```yaml
+name: Release ROS packages
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing GitHub Release tag (X.Y.Z)
+        required: true
+        type: string
+      distros:
+        description: Tracks to release or retry
+        default: humble jazzy kilted lyrical rolling
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  bloom-release:
+    uses: ROBOTIS-GIT/github_workflows/.github/workflows/bloom-release.yml@main
+    with:
+      repository: dynamixel_sdk
+      release_repository: ros2-gbp/dynamixel_sdk-release
+      version: ${{ inputs.version }}
+      distros: ${{ inputs.distros }}
+      git_user_name: ${{ vars.BLOOM_GIT_NAME }}
+      git_user_email: ${{ vars.BLOOM_GIT_EMAIL }}
+      signing_key_fingerprint: ${{ vars.BLOOM_GPG_FINGERPRINT }}
+    secrets:
+      BLOOM_GITHUB_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+      BLOOM_GPG_PRIVATE_KEY: ${{ secrets.BLOOM_GPG_PRIVATE_KEY }}
+      BLOOM_GPG_PASSPHRASE: ${{ secrets.BLOOM_GPG_PASSPHRASE }}
+```
+
+Retry with the same version and only failed distros if desired. Already-generated
+versions reuse their existing release revision and run only the PR phase. Open
+PRs from the token owner and versions already registered in rosdistro are skipped.
+Downgrades and missing package release tags fail instead of silently rebuilding.
+If another track has advanced the shared upstream branch to a newer version,
+an older PR-only retry fails rather than proposing the wrong package metadata;
+recover that PR manually. Normal same-version multi-distro retries are supported.
+Branches and tags are pushed atomically. Only bloom's shared `upstream/<version>`
+and `<track-name>/<version>` import tags may be replaced, with explicit leases
+against their original SHA; package release tags are not force-updated.
+Repositories which disallow this or
+require manual approval of generated branch updates need their policy configured
+before enabling automation. One distro failure does not prevent the remaining
+selected distros from running; the final job fails and reports per-distro results.
+
+Concurrency is scoped to the caller. Designate **one calling repository per
+release repository**, and do not run manual bloom releases concurrently with it.
+GitHub concurrency may replace a pending run with a newer run; use the manual
+caller to recover a skipped version.
+
+Local checks: `python3 -m unittest discover -s tests -v` (PyYAML and jq required).
+These verify planning, YAML/shell structure and push guards; live bloom generation,
+GitHub credential access, and build farm publication require a configured caller.
